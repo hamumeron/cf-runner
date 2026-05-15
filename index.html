@@ -742,16 +742,47 @@ function stopResize() { resizing = false; document.removeEventListener('mousemov
 // JavaScriptはブラウザのWeb Workerで実行（Cloudflare Workerのeval制限を回避）
 // Python/Go/Bash等はCloudflare Worker経由で外部ランナーに送る
 
+// export default { fetch(){} } 形式を自動変換してfetchを呼び出す
+function transformCode(code) {
+  // モジュール構文を除去して実行可能な形に変換
+  // export default { async fetch(req, env, ctx){...} } → fetchを直接実行
+  const exportDefaultMatch = code.match(/export\s+default\s+\{([\s\S]*)\}\s*;?\s*$/);
+  if (exportDefaultMatch) {
+    const inner = exportDefaultMatch[1];
+    const fetchMatch = inner.match(/async\s+fetch\s*\(([^)]*)\)\s*\{([\s\S]*)\}[\s\S]*$/);
+    if (fetchMatch) {
+      return `
+// export default { fetch() } を自動変換して実行
+(async () => {
+  ${inner.replace(/^\s*async\s+fetch\s*\([^)]*\)\s*\{/, '').replace(/\}\s*$/, '')}
+  // ※ fetch/Request/Response はブラウザAPIを使用
+})().then(result => {
+  if (result instanceof Response) {
+    return result.text().then(t => console.log(t));
+  } else if (result !== undefined) {
+    console.log(result);
+  }
+}).catch(e => console.error(e.message));
+`;
+    }
+  }
+  // import/export文を除去（簡易）
+  return code
+    .replace(/^export\s+default\s+/gm, '')
+    .replace(/^export\s+(const|let|var|function|class|async)/gm, '$1')
+    .replace(/^import\s+.*?from\s+['""][^'""]*['""];?\s*$/gm, '// import removed');
+}
+
 function runJavaScriptInBrowser(code, timeoutMs) {
   return new Promise((resolve) => {
     const start = Date.now();
-    const logs = [];
 
-    // Web Worker用のコードをBlobで生成
+    // モジュール構文を変換
+    const transformed = transformCode(code);
+
+    // Web Worker用コードをBlobで生成（type:moduleで実行）
     const workerCode = `
-      // console をキャプチャ
       const _logs = [];
-      const _origLog = console.log;
       ['log','error','warn','info'].forEach(level => {
         console[level] = (...args) => {
           _logs.push({ level, msg: args.map(v => {
@@ -763,13 +794,12 @@ function runJavaScriptInBrowser(code, timeoutMs) {
         };
       });
 
-      // タイムアウト
       const _timer = setTimeout(() => {
         postMessage({ error: 'タイムアウト: ${timeoutMs}ms を超えました', logs: _logs, elapsed: Date.now() });
       }, ${timeoutMs});
 
       try {
-        const _fn = new Function(${JSON.stringify(code)});
+        const _fn = new Function(${JSON.stringify(transformed)});
         const _result = _fn();
         if (_result && typeof _result.then === 'function') {
           _result.then(() => {
@@ -796,13 +826,12 @@ function runJavaScriptInBrowser(code, timeoutMs) {
     worker.onmessage = (e) => {
       worker.terminate();
       URL.revokeObjectURL(blobUrl);
-      const elapsed = Date.now() - start;
-      resolve({ ...e.data, elapsed, region: 'browser' });
+      resolve({ ...e.data, elapsed: Date.now() - start, region: 'browser' });
     };
     worker.onerror = (e) => {
       worker.terminate();
       URL.revokeObjectURL(blobUrl);
-      resolve({ error: e.message || '実行エラー', logs, elapsed: Date.now() - start, region: 'browser' });
+      resolve({ error: e.message || '実行エラー', logs: [], elapsed: Date.now() - start, region: 'browser' });
     };
   });
 }
